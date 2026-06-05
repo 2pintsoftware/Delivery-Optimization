@@ -206,6 +206,24 @@ function Format-ErrorCode {
     return [string]$Code
 }
 
+function Get-MCCTypeDescription {
+    # Classifies a Connected Cache server by its X-CID HTTP response header value.
+    # X-CID < 100    → CDN (not MCC)
+    # X-CID = 100    → MCC on Distribution Point (ConfigMgr DP)
+    # X-CID = 10000  → MCC Standalone
+    # X-CID > 10000  → Internet MCC (Microsoft-hosted)
+    param([object]$XCid)
+    if ($null -eq $XCid) { return $null }
+    try {
+        $cid = [int]$XCid
+        if ($cid -lt 100)   { return 'CDN' }
+        if ($cid -eq 100)   { return 'MCC on Distribution Point' }
+        if ($cid -eq 10000) { return 'MCC Standalone' }
+        if ($cid -gt 10000) { return 'Internet MCC' }
+    } catch {}
+    return "Unknown (X-CID=$XCid)"
+}
+
 function Write-Header {
     param([string]$Title)
     $line = "=" * 70
@@ -248,6 +266,9 @@ function Get-DOParsedDownloadComplete {
                 ($matches[1] -replace '\[([^\]]+)\]', '$1').TrimEnd(';')
             } else { $null }
             CacheHost          = if ($msg -match 'cacheHost = ([^,]*)') { $matches[1] } else { $null }
+            MccIp              = if ($msg -match 'cacheHost = (?:\w+:)?(\d{1,3}(?:\.\d{1,3}){3})') { $matches[1] } else { $null }
+            XCid               = if ($msg -match 'X-CID:(\d+)') { [int]$matches[1] } else { $null }
+            XCcc               = if ($msg -match 'X-CCC:([^;,\s]+)') { $matches[1] } else { $null }
             FileBytes          = if ($msg -match 'File: (\d+)') { [long]$matches[1] } else { $null }
             CdnBytes           = if ($msg -match 'CDN: (\d+)') { [long]$matches[1] } else { $null }
             DoincBytes         = if ($msg -match 'DOINC: (\d+)') { [long]$matches[1] } else { $null }
@@ -499,6 +520,8 @@ function Initialize-DOLogs {
             $cdnSum   = [long]($grp | Measure-Object CdnBytes      -Sum).Sum
             $doincSum = [long]($grp | Measure-Object DoincBytes    -Sum).Sum
             $llSum    = [long]($grp | Measure-Object LinkLocalBytes -Sum).Sum
+            $lcacheSum = [long]($grp | Measure-Object LcacheBytes   -Sum).Sum
+            $mccIp    = ($grp | Where-Object { $_.MccIp } | Select-Object -Last 1).MccIp
             [PSCustomObject]@{
                 TimeCreated         = $rep.TimeCreated
                 FileId              = $rep.FileId
@@ -511,6 +534,7 @@ function Initialize-DOLogs {
                 FileBytes           = $rep.FileBytes
                 CdnBytes            = $cdnSum
                 DoincBytes          = $doincSum
+                LcacheBytes         = $lcacheSum
                 LanBytes            = $lanSum
                 LinkLocalBytes      = $llSum
                 GroupBytes          = $grpSum
@@ -527,9 +551,19 @@ function Initialize-DOLogs {
                 Background          = $rep.Background
                 IsVpn               = $rep.IsVpn
                 IsThrottled         = $rep.IsThrottled
+                MccIp               = $mccIp
             }
         }
     )
+    # Build IP → X-CID lookup from all events that carry both a server IP and an X-CID header value.
+    # Seen in: TraceErrorCdnComm (serverIp field), TraceDownloadPaused (cdnIP field), error header dumps.
+    $script:XCidByIp = @{}
+    $script:RawLogs | Where-Object { $_.Message -match '\[\d{1,3}(?:\.\d{1,3}){3}\].*X-CID:\d+' } | ForEach-Object {
+        if ($_.Message -match '\[(\d{1,3}(?:\.\d{1,3}){3})\].*?X-CID:(\d+)') {
+            $ip = $matches[1]; $xc = [int]$matches[2]
+            if (-not $script:XCidByIp.ContainsKey($ip)) { $script:XCidByIp[$ip] = $xc }
+        }
+    }
     $script:AnnounceComplete   = @(Get-DOParsedAnnounceComplete   $script:RawLogs)
     $script:InternalAnnounce   = @(Get-DOParsedInternalAnnounce   $script:RawLogs)
     $script:ConnectionComplete = @(Get-DOParsedConnectionComplete  $script:RawLogs)
@@ -588,20 +622,32 @@ function Show-SummaryDashboard {
     Write-SubHeader "Downloads ($($script:UniqueDownloads.Count) unique files, $($script:DownloadComplete.Count) segment events)"
 
     if ($script:DownloadComplete.Count -gt 0) {
-        $totalFile   = ($script:UniqueDownloads | Measure-Object -Property FileBytes  -Sum).Sum
-        $totalCdn    = ($script:UniqueDownloads | Measure-Object -Property CdnBytes   -Sum).Sum
-        $totalDoinc  = ($script:UniqueDownloads | Measure-Object -Property DoincBytes -Sum).Sum
-        $totalLan    = ($script:UniqueDownloads | Measure-Object -Property LanBytes   -Sum).Sum
-        $totalGroup  = ($script:UniqueDownloads | Measure-Object -Property GroupBytes -Sum).Sum
-        $totalInet   = ($script:UniqueDownloads | Measure-Object -Property InetBytes  -Sum).Sum
+        $totalFile   = ($script:UniqueDownloads | Measure-Object -Property FileBytes   -Sum).Sum
+        $totalCdn    = ($script:UniqueDownloads | Measure-Object -Property CdnBytes    -Sum).Sum
+        $totalDoinc  = ($script:UniqueDownloads | Measure-Object -Property DoincBytes  -Sum).Sum
+        $totalMcc    = $totalDoinc
+        $totalLan    = ($script:UniqueDownloads | Measure-Object -Property LanBytes    -Sum).Sum
+        $totalGroup  = ($script:UniqueDownloads | Measure-Object -Property GroupBytes  -Sum).Sum
+        $totalInet   = ($script:UniqueDownloads | Measure-Object -Property InetBytes   -Sum).Sum
         $totalP2P    = $totalLan + $totalGroup + $totalInet
         $p2pPct      = if ($totalFile -gt 0) { [math]::Round(($totalP2P / $totalFile) * 100, 1) } else { 0 }
-        $doincPct    = if ($totalFile -gt 0) { [math]::Round(($totalDoinc / $totalFile) * 100, 1) } else { 0 }
-        $cdnPct      = if ($totalFile -gt 0) { [math]::Round(($totalCdn / $totalFile) * 100, 1) } else { 0 }
+        $mccPct      = if ($totalFile -gt 0) { [math]::Round(($totalMcc  / $totalFile) * 100, 1) } else { 0 }
+        $cdnPct      = if ($totalFile -gt 0) { [math]::Round(($totalCdn  / $totalFile) * 100, 1) } else { 0 }
 
         Write-Host "  Total data delivered  : $(Format-Bytes $totalFile)" -ForegroundColor White
         Write-Host "    CDN                 : $(Format-Bytes $totalCdn) ($cdnPct%)" -ForegroundColor $(if ($cdnPct -gt 80) { 'Yellow' } else { 'Gray' })
-        Write-Host "    Connected Cache     : $(Format-Bytes $totalDoinc) ($doincPct%)" -ForegroundColor Cyan
+        Write-Host "    Connected Cache     : $(Format-Bytes $totalMcc) ($mccPct%)" -ForegroundColor Cyan
+        if ($totalMcc -gt 0) {
+            # Show per-server X-CID type breakdown
+            $mccServers = $script:UniqueDownloads | Where-Object { $_.MccIp } |
+                Select-Object -ExpandProperty MccIp -Unique | Sort-Object | ForEach-Object {
+                    $xcid    = if ($script:XCidByIp -and $script:XCidByIp.ContainsKey($_)) { $script:XCidByIp[$_] } else { $null }
+                    $mccType = Get-MCCTypeDescription $xcid
+                    $xcStr   = if ($null -ne $xcid) { " (X-CID=$xcid)" } else { '' }
+                    "      $_${xcStr}  → $mccType"
+                }
+            foreach ($line in $mccServers) { Write-Host $line -ForegroundColor DarkCyan }
+        }
         Write-Host "    LAN peers           : $(Format-Bytes $totalLan)" -ForegroundColor Green
         Write-Host "    Group peers         : $(Format-Bytes $totalGroup)" -ForegroundColor Green
         Write-Host "    Internet peers      : $(Format-Bytes $totalInet)" -ForegroundColor Green
@@ -689,18 +735,20 @@ function Show-DownloadAnalysisMenu {
         Write-Host "  1. All downloads (GridView)"
         Write-Host "  2. Filter by Caller"
         Write-Host "  3. Trace individual job (full event timeline)"
-        Write-Host "  4. Failed / error downloads"
-        Write-Host "  5. Downloads with P2P activity"
-        Write-Host "  6. Downloads via Connected Cache (DOINC)"
+        Write-Host "  4. Session summary (byte sources for a file/session)"
+        Write-Host "  5. Failed / error downloads"
+        Write-Host "  6. Downloads with P2P activity (GridView)"
+        Write-Host "  7. Downloads via Connected Cache (MCC) (GridView)"
         Write-Host "  Q. Back"
         $sel = (Read-Host "`n  Selection").Trim().ToLower()
         switch ($sel) {
             '1' { $script:DownloadComplete | Out-GridView -Title "All Downloads ($($script:DownloadComplete.Count))" }
             '2' { Show-DownloadsByCaller }
             '3' { Invoke-JobTrace }
-            '4' { Show-FailedDownloads }
-            '5' { $script:DownloadComplete | Where-Object { ($_.LanBytes + $_.GroupBytes + $_.InetBytes) -gt 0 } | Out-GridView -Title "Downloads with P2P bytes" }
-            '6' { $script:DownloadComplete | Where-Object { $_.DoincBytes -gt 0 } | Out-GridView -Title "Downloads via Connected Cache" }
+            '4' { Invoke-SessionSummary }
+            '5' { Show-FailedDownloads }
+            '6' { $script:DownloadComplete | Where-Object { ($_.LanBytes + $_.GroupBytes + $_.InetBytes) -gt 0 } | Out-GridView -Title "Downloads with P2P bytes" }
+            '7' { $script:DownloadComplete | Where-Object { $_.DoincBytes -gt 0 } | Out-GridView -Title "Downloads via Connected Cache (MCC)" }
             'q' { return }
             default { Write-Host "  Invalid selection." -ForegroundColor Red; Pause-ForUser }
         }
@@ -776,33 +824,39 @@ function Invoke-JobTrace {
         return
     }
 
-    $fileId    = $selectedJob.FileId
-    $jobId     = $selectedJob.JobId
-    $jobTime   = $selectedJob.TimeCreated
+    $fileId      = $selectedJob.FileId
+    $jobId       = $selectedJob.JobId
+    $jobTime     = $selectedJob.TimeCreated
     $windowStart = $jobTime.AddMinutes(-30)
     $windowEnd   = $jobTime.AddMinutes(5)
+
+    # Use UniqueDownloads aggregated bytes so parallel segment jobs are summed correctly
+    $fileDownload = $script:UniqueDownloads | Where-Object {
+        $_.FileId -eq $fileId -and $_.SessionId -eq $selectedJob.SessionId
+    } | Select-Object -First 1
+    $srcRef = if ($fileDownload) { $fileDownload } else { $selectedJob }
 
     Write-Header "Job Trace: $jobId"
     Write-Host "  FileId     : $fileId" -ForegroundColor Gray
     Write-Host "  Caller     : $($selectedJob.Caller)" -ForegroundColor Gray
     Write-Host "  Completed  : $jobTime" -ForegroundColor Gray
 
-    # Find SwarmId — match InternalAnnounce by ContentId ≈ FileId
-    # ContentId in InternalAnnounce is typically the first part of FileId (before first underscore for some callers)
-    $matchingAnnounces = $script:InternalAnnounce | Where-Object {
-        $_.TimeCreated -ge $windowStart -and $_.TimeCreated -le $windowEnd -and (
-            ($_.ContentId -and $fileId -and ($fileId -like "*$($_.ContentId)*" -or $_.ContentId -like "*$fileId*")) -or
-            ($_.SwarmId -and $_.SwarmId -ne '')
-        )
+    # Find SwarmIds — try ContentId ≈ FileId first; fall back to all SwarmIds in the time window
+    $swarmIds = @($script:InternalAnnounce | Where-Object {
+        $_.TimeCreated -ge $windowStart -and $_.TimeCreated -le $windowEnd -and
+        $_.ContentId -and $fileId -and ($fileId -like "*$($_.ContentId)*" -or $_.ContentId -like "*$fileId*")
+    } | Select-Object -ExpandProperty SwarmId | Where-Object { $_ } | Sort-Object -Unique)
+    if ($swarmIds.Count -eq 0) {
+        $swarmIds = @($script:InternalAnnounce | Where-Object {
+            $_.TimeCreated -ge $windowStart -and $_.TimeCreated -le $windowEnd -and
+            $_.SwarmId -and $_.SwarmId -ne ''
+        } | Select-Object -ExpandProperty SwarmId | Where-Object { $_ } | Sort-Object -Unique)
     }
 
-    # Use all SwarmIds found in the time window for this job
-    $swarmIds = @($matchingAnnounces.SwarmId | Where-Object { $_ } | Sort-Object -Unique)
-
-    # Build timeline
+    # Build timeline — flat descriptive columns usable directly in GridView
     $timeline = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-    # InternalAnnounce events
+    # AnnounceRequest events (InternalAnnounce — what DO sent to the discovery server)
     $iaEvents = $script:InternalAnnounce | Where-Object {
         $_.TimeCreated -ge $windowStart -and $_.TimeCreated -le $windowEnd -and
         ($swarmIds.Count -eq 0 -or $swarmIds -contains $_.SwarmId)
@@ -810,15 +864,16 @@ function Invoke-JobTrace {
     foreach ($e in $iaEvents) {
         $timeline.Add([PSCustomObject]@{
             TimeCreated = $e.TimeCreated
-            EventType   = 'InternalAnnounce'
+            EventType   = 'AnnounceRequest'
+            PeerIP      = $e.ReportedIp
             SwarmId     = $e.SwarmId
-            Key1        = "Scope=$($e.ScopeDesc) Seq=$($e.Seq)"
-            Key2        = "Downloaded=$(Format-Bytes $e.Downloaded) Left=$(Format-Bytes $e.Left)"
-            Key3        = "Event=$($e.JoinRequestEventDesc)"
+            BytesRecv   = if ($e.Downloaded -gt 0) { Format-Bytes $e.Downloaded } else { '' }
+            BytesSent   = if ($e.Uploaded   -gt 0) { Format-Bytes $e.Uploaded   } else { '' }
+            Detail      = "Scope=$($e.ScopeDesc)  Seq=$($e.Seq)  Event=$($e.JoinRequestEventDesc)  Left=$(Format-Bytes $e.Left)"
         })
     }
 
-    # AnnounceComplete events
+    # AnnounceResponse events (AnnounceComplete — what the discovery server returned)
     $acEvents = $script:AnnounceComplete | Where-Object {
         $_.TimeCreated -ge $windowStart -and $_.TimeCreated -le $windowEnd -and
         ($swarmIds.Count -eq 0 -or $swarmIds -contains $_.SwarmId)
@@ -826,54 +881,83 @@ function Invoke-JobTrace {
     foreach ($e in $acEvents) {
         $timeline.Add([PSCustomObject]@{
             TimeCreated = $e.TimeCreated
-            EventType   = 'AnnounceComplete'
+            EventType   = 'AnnounceResponse'
+            PeerIP      = ''
             SwarmId     = $e.SwarmId
-            Key1        = "NPeers=$($e.NPeers) Hr=$($e.Hr)"
-            Key2        = if ($e.FailureReason) { "FailureReason=$($e.FailureReason)" } else { "Server=$($e.Server)" }
-            Key3        = "PeerCount=$($e.PeerCount)"
+            BytesRecv   = ''
+            BytesSent   = ''
+            Detail      = if ($e.FailureReason) { "FAILED: $($e.FailureReason)  Hr=$($e.Hr)" }
+                          else { "NPeers=$($e.NPeers)  PeerCount=$($e.PeerCount)  Server=$($e.Server)" }
         })
     }
 
-    # ConnectionComplete events (time-window only — no SwarmId available)
+    # PeerConnected events (CConnMan::ConnectionComplete — TCP session opened)
     $ccEvents = $script:ConnectionComplete | Where-Object {
         $_.TimeCreated -ge $windowStart -and $_.TimeCreated -le $windowEnd
     }
     foreach ($e in $ccEvents) {
         $timeline.Add([PSCustomObject]@{
             TimeCreated = $e.TimeCreated
-            EventType   = 'ConnectionComplete'
+            EventType   = 'PeerConnected'
+            PeerIP      = $e.PeerIP
             SwarmId     = ''
-            Key1        = "PeerIP=$($e.PeerIP)"
-            Key2        = ''
-            Key3        = ''
+            BytesRecv   = ''
+            BytesSent   = ''
+            Detail      = 'TCP connection established'
         })
     }
 
-    # The download completion itself
+    # PeerDataTransfer events (CSwarmConn::~CSwarmConn final stats — bytes per TCP session)
+    $psEvents = if ($swarmIds.Count -gt 0) {
+        @($script:PeerStats | Where-Object { $swarmIds -contains $_.SwarmId })
+    } else {
+        @($script:PeerStats | Where-Object { $_.TimeCreated -ge $windowStart -and $_.TimeCreated -le $windowEnd })
+    }
+    foreach ($e in $psEvents) {
+        $timeline.Add([PSCustomObject]@{
+            TimeCreated = $e.TimeCreated
+            EventType   = 'PeerDataTransfer'
+            PeerIP      = if ($e.Port) { "$($e.PeerIP):$($e.Port)" } else { $e.PeerIP }
+            SwarmId     = $e.SwarmId
+            BytesRecv   = if ($e.BytesRecv -gt 0) { Format-Bytes $e.BytesRecv } else { '' }
+            BytesSent   = if ($e.BytesSent -gt 0) { Format-Bytes $e.BytesSent } else { '' }
+            Detail      = "ConnType=$($e.ConnType)  PeerId=$($e.PeerId)"
+        })
+    }
+
+    # DownloadComplete marker
+    $peerBytes = [long]$srcRef.LanBytes + [long]$srcRef.GroupBytes + [long]$srcRef.InetBytes
     $timeline.Add([PSCustomObject]@{
         TimeCreated = $selectedJob.TimeCreated
         EventType   = 'DownloadComplete'
+        PeerIP      = $selectedJob.CdnIp
         SwarmId     = ''
-        Key1        = "Caller=$($selectedJob.Caller) Mode=$(Get-DODownloadModeDescription $selectedJob.DownloadMode)"
-        Key2        = "File=$(Format-Bytes $selectedJob.FileBytes) CDN=$(Format-Bytes $selectedJob.CdnBytes) LAN=$(Format-Bytes $selectedJob.LanBytes) DOINC=$(Format-Bytes $selectedJob.DoincBytes)"
-        Key3        = "Duration=$(Format-TimeMs $selectedJob.TimeMs) Peers=$($selectedJob.Peers)"
+        BytesRecv   = Format-Bytes $srcRef.FileBytes
+        BytesSent   = ''
+        Detail      = "Caller=$($selectedJob.Caller)  Mode=$(Get-DODownloadModeDescription $selectedJob.DownloadMode)  CDN=$(Format-Bytes $srcRef.CdnBytes)  Peers=$(Format-Bytes $peerBytes)  MCC=$(Format-Bytes $srcRef.DoincBytes)  Dur=$(Format-TimeMs $srcRef.TimeMs)"
     })
 
     $sortedTimeline = $timeline | Sort-Object TimeCreated
 
     # Display timeline in GridView
-    $sortedTimeline | Out-GridView -Title "Job Timeline: $jobId ($($sortedTimeline.Count) events)"
+    $sortedTimeline | Out-GridView -Title "Job Timeline: $jobId  [$($sortedTimeline.Count) events]"
 
-    # Console byte summary
-    Write-SubHeader "Byte Source Summary for this Job"
-    $total = $selectedJob.FileBytes
+    # Console byte summary — use aggregated UniqueDownloads bytes to cover all parallel segments
+    $segNote = if ($fileDownload -and $fileDownload.SegmentCount -gt 1) { " (aggregated across $($fileDownload.SegmentCount) segments)" } else { '' }
+    Write-SubHeader "Byte Source Summary for this Job$segNote"
+    $total = $srcRef.FileBytes
+    # LAN in the ETL is the aggregate of all locally-scoped peer bytes (LAN scope).
+    # LinkLocal is the DNS-SD-discovered subset of that total — not an independent source.
+    # Display them as two mutually-exclusive sub-types so percentages don't double-count.
+    $lanDoSvcBytes = [math]::Max(0, [long]$srcRef.LanBytes - [long]$srcRef.LinkLocalBytes)
     $sources = [ordered]@{
-        'CDN'                  = $selectedJob.CdnBytes
-        'Connected Cache (MCC)'= $selectedJob.DoincBytes
-        'LAN peers'            = $selectedJob.LanBytes
-        'Group peers'          = $selectedJob.GroupBytes
-        'Internet peers'       = $selectedJob.InetBytes
-        'Link-local'           = $selectedJob.LinkLocalBytes
+        'CDN'                       = $srcRef.CdnBytes
+        'Connected Cache (MCC)'     = $srcRef.DoincBytes
+        'LAN peers (DO service)'    = $lanDoSvcBytes
+        'Link-local peers (DNS-SD)' = $srcRef.LinkLocalBytes
+        'Group peers'               = $srcRef.GroupBytes
+        'Internet peers'            = $srcRef.InetBytes
+        'Local cache'               = $srcRef.LcacheBytes
     }
     foreach ($src in $sources.GetEnumerator()) {
         if ($src.Value -gt 0) {
@@ -881,12 +965,94 @@ function Invoke-JobTrace {
             Write-Host ("  {0,-25} : {1,10}  ({2}%)" -f $src.Key, (Format-Bytes $src.Value), $pct) -ForegroundColor White
         }
     }
+    # knownBytes uses LanBytes (the aggregate that already includes LinkLocal) to avoid double-counting.
+    $knownBytes = [long]$srcRef.CdnBytes + [long]$srcRef.DoincBytes + [long]$srcRef.LanBytes +
+                  [long]$srcRef.GroupBytes + [long]$srcRef.InetBytes + [long]$srcRef.LcacheBytes
+    if ($total -gt 0 -and $knownBytes -lt $total) {
+        $gap    = $total - $knownBytes
+        $gapPct = [math]::Round(($gap / $total) * 100, 1)
+        Write-Host ("  {0,-25} : {1,10}  ({2}%)  (segments not captured in this log)" -f '(unaccounted)', (Format-Bytes $gap), $gapPct) -ForegroundColor DarkGray
+    }
+    $speedBps = if ($selectedJob.DownBps -and $selectedJob.DownBps -gt 0) {
+        $selectedJob.DownBps
+    } elseif ($total -gt 0 -and $srcRef.TimeMs -gt 0) {
+        [long]($total / ($srcRef.TimeMs / 1000.0))
+    } else { 0 }
     Write-Host ("  {0,-25} : {1,10}" -f 'Total file size', (Format-Bytes $total)) -ForegroundColor Cyan
-    Write-Host ("  {0,-25} : {1}" -f 'Duration', (Format-TimeMs $selectedJob.TimeMs)) -ForegroundColor Cyan
+    Write-Host ("  {0,-25} : {1}" -f 'Duration', (Format-TimeMs $srcRef.TimeMs)) -ForegroundColor Cyan
+    if ($speedBps -gt 0) {
+        Write-Host ("  {0,-25} : {1}/s" -f 'Avg Download Speed', (Format-Bytes $speedBps)) -ForegroundColor Cyan
+    }
     Write-Host ("  {0,-25} : {1}  ({2})" -f 'Download Mode', $selectedJob.DownloadMode, (Get-DODownloadModeDescription $selectedJob.DownloadMode)) -ForegroundColor Cyan
     Write-Host ("  {0,-25} : {1}  ({2})" -f 'Mode Source', $selectedJob.DownloadModeSrc, (Get-DODownloadModeSrcDescription $selectedJob.DownloadModeSrc)) -ForegroundColor Cyan
-    if ($selectedJob.IsVpn) { Write-Host "  VPN was active during this download" -ForegroundColor Yellow }
-    if ($selectedJob.IsThrottled) { Write-Host "  Download was throttled" -ForegroundColor Yellow }
+    if ($selectedJob.IsVpn)       { Write-Host "  VPN was active during this download" -ForegroundColor Yellow }
+    if ($selectedJob.IsThrottled) { Write-Host "  Download was throttled"              -ForegroundColor Yellow }
+
+    Pause-ForUser
+}
+
+function Invoke-SessionSummary {
+    if ($script:UniqueDownloads.Count -eq 0) {
+        Write-Host "`n  No aggregated downloads found." -ForegroundColor Yellow
+        Pause-ForUser
+        return
+    }
+
+    Write-Host "`n  Select a file/session to summarise (GridView will open)..." -ForegroundColor Yellow
+    $selected = $script:UniqueDownloads | Out-GridView -Title "Select File/Session ($($script:UniqueDownloads.Count) entries)" -OutputMode Single
+
+    if (-not $selected) {
+        Write-Host "  No selection made." -ForegroundColor Gray
+        return
+    }
+
+    Write-Header "Session Summary: $($selected.FileId)"
+    Write-Host "  FileId     : $($selected.FileId)"     -ForegroundColor Gray
+    Write-Host "  SessionId  : $($selected.SessionId)"  -ForegroundColor Gray
+    Write-Host "  Caller     : $($selected.Caller)"     -ForegroundColor Gray
+    Write-Host "  Completed  : $($selected.TimeCreated)" -ForegroundColor Gray
+    Write-Host "  Segments   : $($selected.SegmentCount)" -ForegroundColor Gray
+
+    $segNote       = if ($selected.SegmentCount -gt 1) { " (aggregated across $($selected.SegmentCount) segments)" } else { '' }
+    Write-SubHeader "Byte Source Summary$segNote"
+    $total         = $selected.FileBytes
+    $lanDoSvcBytes = [math]::Max(0, [long]$selected.LanBytes - [long]$selected.LinkLocalBytes)
+    $sources = [ordered]@{
+        'CDN'                       = $selected.CdnBytes
+        'Connected Cache (MCC)'     = $selected.DoincBytes
+        'LAN peers (DO service)'    = $lanDoSvcBytes
+        'Link-local peers (DNS-SD)' = $selected.LinkLocalBytes
+        'Group peers'               = $selected.GroupBytes
+        'Internet peers'            = $selected.InetBytes
+        'Local cache'               = $selected.LcacheBytes
+    }
+    foreach ($src in $sources.GetEnumerator()) {
+        if ($src.Value -gt 0) {
+            $pct = if ($total -gt 0) { [math]::Round(($src.Value / $total) * 100, 1) } else { 0 }
+            Write-Host ("  {0,-25} : {1,10}  ({2}%)" -f $src.Key, (Format-Bytes $src.Value), $pct) -ForegroundColor White
+        }
+    }
+    $knownBytes = [long]$selected.CdnBytes + [long]$selected.DoincBytes + [long]$selected.LanBytes +
+                  [long]$selected.GroupBytes + [long]$selected.InetBytes + [long]$selected.LcacheBytes
+    if ($total -gt 0 -and $knownBytes -lt $total) {
+        $gap    = $total - $knownBytes
+        $gapPct = [math]::Round(($gap / $total) * 100, 1)
+        Write-Host ("  {0,-25} : {1,10}  ({2}%)  (segments not captured in this log)" -f '(unaccounted)', (Format-Bytes $gap), $gapPct) -ForegroundColor DarkGray
+    }
+    $speedBps = if ($selected.DownBps -and $selected.DownBps -gt 0) {
+        $selected.DownBps
+    } elseif ($total -gt 0 -and $selected.TimeMs -gt 0) {
+        [long]($total / ($selected.TimeMs / 1000.0))
+    } else { 0 }
+    Write-Host ("  {0,-25} : {1,10}" -f 'Total file size',    (Format-Bytes $total))             -ForegroundColor Cyan
+    Write-Host ("  {0,-25} : {1}"    -f 'Duration',            (Format-TimeMs $selected.TimeMs))  -ForegroundColor Cyan
+    if ($speedBps -gt 0) {
+        Write-Host ("  {0,-25} : {1}/s" -f 'Avg Download Speed', (Format-Bytes $speedBps))        -ForegroundColor Cyan
+    }
+    Write-Host ("  {0,-25} : {1}  ({2})" -f 'Download Mode', $selected.DownloadMode, (Get-DODownloadModeDescription $selected.DownloadMode))     -ForegroundColor Cyan
+    Write-Host ("  {0,-25} : {1}  ({2})" -f 'Mode Source',   $selected.DownloadModeSrc, (Get-DODownloadModeSrcDescription $selected.DownloadModeSrc)) -ForegroundColor Cyan
+    if ($selected.IsVpn)       { Write-Host "  VPN was active during this download" -ForegroundColor Yellow }
+    if ($selected.IsThrottled) { Write-Host "  Download was throttled"              -ForegroundColor Yellow }
 
     Pause-ForUser
 }
@@ -1362,22 +1528,95 @@ function Show-PeeringFailureAnalysis {
 
 #region ─── Network & GEO ────────────────────────────────────────────────────
 
+function Show-MCCAnalysisReport {
+    Write-Header "Connected Cache (MCC) Analysis"
+    if (-not (Assert-LogsLoaded)) { return }
+
+    # MCC delivery bytes are tracked by the DOINC field. lcache is DO's internal local-cache
+    # accounting and does NOT represent bytes received from a network Connected Cache server.
+    $mccDownloads = @($script:UniqueDownloads | Where-Object { $_.DoincBytes -gt 0 })
+
+    if ($mccDownloads.Count -eq 0) {
+        Write-Host "`n  No Connected Cache (MCC) activity found in this log." -ForegroundColor Yellow
+        Pause-ForUser
+        return
+    }
+
+    $totalAll = [long]($script:UniqueDownloads | Measure-Object FileBytes -Sum).Sum
+    $totalMcc = [long]($mccDownloads | Measure-Object DoincBytes -Sum).Sum
+    $mccPct   = if ($totalAll -gt 0) { [math]::Round($totalMcc / $totalAll * 100, 1) } else { 0 }
+
+    Write-SubHeader "Overall MCC Activity"
+    Write-Host ("  Downloads using MCC    : {0} of {1}" -f $mccDownloads.Count, $script:UniqueDownloads.Count) -ForegroundColor White
+    Write-Host ("  Total bytes from MCC   : {0}  ({1}% of all downloaded data)" -f (Format-Bytes $totalMcc), $mccPct) -ForegroundColor Cyan
+
+    # Per-server breakdown grouped by MCC IP
+    $byServer = @($mccDownloads | Where-Object { $_.MccIp } |
+        Group-Object MccIp | ForEach-Object {
+            $grp      = $_.Group
+            $mccIp    = $_.Name
+            $svrBytes = [long]($grp | Measure-Object DoincBytes -Sum).Sum
+            $xcid     = if ($script:XCidByIp -and $script:XCidByIp.ContainsKey($mccIp)) { $script:XCidByIp[$mccIp] } else { $null }
+            $mccType  = if ($null -ne $xcid) { Get-MCCTypeDescription $xcid } else { 'Unknown (X-CID not observed)' }
+            [PSCustomObject]@{
+                MccIP      = $mccIp
+                XCid       = if ($null -ne $xcid) { $xcid } else { '?' }
+                MccType    = $mccType
+                Downloads  = $grp.Count
+                Bytes      = $svrBytes
+                BytesHuman = Format-Bytes $svrBytes
+                PctOfTotal = if ($totalAll -gt 0) { [math]::Round($svrBytes / $totalAll * 100, 1) } else { 0 }
+            }
+        } | Sort-Object Bytes -Descending)
+
+    if ($byServer.Count -gt 0) {
+        Write-SubHeader "Per-MCC-Server Breakdown"
+        foreach ($svr in $byServer) {
+            $typeColor = if ($svr.MccType -match 'Distribution Point') { 'Green'  }
+                         elseif ($svr.MccType -match 'Standalone')      { 'Cyan'   }
+                         elseif ($svr.MccType -match 'Internet')        { 'Yellow' }
+                         elseif ($svr.MccType -match 'CDN')             { 'Gray'   }
+                         else                                            { 'White'  }
+            Write-Host ""
+            Write-Host ("  Server  : {0}" -f $svr.MccIP)                                               -ForegroundColor White
+            Write-Host ("  X-CID   : {0}" -f $svr.XCid)                                               -ForegroundColor White
+            Write-Host ("  Type    : {0}" -f $svr.MccType)                                             -ForegroundColor $typeColor
+            Write-Host ("  Files   : {0} download(s)" -f $svr.Downloads)                              -ForegroundColor White
+            Write-Host ("  Bytes   : {0}  ({1}% of total data)" -f $svr.BytesHuman, $svr.PctOfTotal) -ForegroundColor Cyan
+        }
+        Write-Host ""
+        $byServer | Select-Object MccIP, XCid, MccType, Downloads, BytesHuman, PctOfTotal |
+            Out-GridView -Title "MCC Server Breakdown ($($byServer.Count) server(s))"
+    } else {
+        Write-Host "`n  MCC activity detected but server IP could not be resolved (cacheHost field empty in logs)." -ForegroundColor Yellow
+        Write-Host ("  Total MCC bytes: {0}" -f (Format-Bytes $totalMcc)) -ForegroundColor Cyan
+    }
+
+    # GridView of all downloads with MCC involvement
+    $mccDownloads |
+        Select-Object TimeCreated, Caller,
+            @{ N = 'FileSize'; E = { Format-Bytes $_.FileBytes } },
+            @{ N = 'MCCBytes'; E = { Format-Bytes $_.DoincBytes } },
+            @{ N = 'CDNBytes'; E = { Format-Bytes $_.CdnBytes } },
+            @{ N = 'P2PBytes'; E = { Format-Bytes ([long]$_.LanBytes + [long]$_.GroupBytes + [long]$_.InetBytes) } },
+            MccIp, DownloadModeDesc, IsVpn |
+        Out-GridView -Title "Downloads with MCC Activity ($($mccDownloads.Count))"
+
+    Pause-ForUser
+}
+
 function Show-NetworkGeoMenu {
     do {
         if (-not (Assert-LogsLoaded)) { return }
         Write-Header "Network & GEO Analysis"
         Write-Host "  1. GEO service responses / External IP history (GridView)"
-        Write-Host "  2. Connected Cache (MCC) download activity (GridView)"
+        Write-Host "  2. Connected Cache (MCC) analysis"
         Write-Host "  3. CDN source analysis (GridView)"
         Write-Host "  Q. Back"
         $sel = (Read-Host "`n  Selection").Trim().ToLower()
         switch ($sel) {
             '1' { $script:GeoResponses | Out-GridView -Title "GEO Responses ($($script:GeoResponses.Count))" }
-            '2' {
-                $mcc = $script:DownloadComplete | Where-Object { $_.DoincBytes -gt 0 -or $_.CacheHost }
-                if ($mcc.Count -eq 0) { Write-Host "`n  No Connected Cache activity found." -ForegroundColor Yellow; Pause-ForUser }
-                else { $mcc | Select-Object TimeCreated, Caller, CacheHost, FileBytes, DoincBytes, CdnBytes, DownloadModeDesc | Out-GridView -Title "Connected Cache Downloads ($($mcc.Count))" }
-            }
+            '2' { Show-MCCAnalysisReport }
             '3' {
                 $cdnData = $script:DownloadComplete | Where-Object { $_.CdnIp -or $_.CdnUrl } |
                     Select-Object TimeCreated, Caller, CdnUrl, CdnIp, CdnBytes, FileBytes, DownloadModeDesc
@@ -1612,6 +1851,7 @@ function Show-MainMenu {
 $script:LogPath = $LogPath
 $script:RawLogs = $null
 $script:LogSourceDesc = $null
+$script:XCidByIp = @{}
 
 # Auto-load if path provided — skip interactive prompt
 if ($LogPath) {
