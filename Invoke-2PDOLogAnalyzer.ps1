@@ -26,11 +26,14 @@
     .\Invoke-2PDOLogAnalyzer.ps1 -LogPath "C:\DOLogs\DOETLLogs_Machine_20250515"
 
 .NOTES
-    Version:        1.1
+    Version:        1.2
     Author:         Mattias Benninge @ 2Pint Software
     Creation Date:  2026-05-15
     Purpose/Change: Comprehensive update for DO API spec alignment, error lookup fixes,
                     expanded protocol enums, and improved multi-segment correlation.
+                    v1.2: Single-result GridView popups (job timeline, per-swarm summary,
+                    MCC server breakdown, GEO history, status correlation) replaced with
+                    bordered console tables/cards via Write-DOTable / Write-DOCard.
 
     Requires Windows 10/11 with the DeliveryOptimization PowerShell module.
     GridView output requires Windows PowerShell or PowerShell 7+ on Windows.
@@ -203,7 +206,8 @@ function Get-DODownloadModeSrcDescription {
 
 function Format-ErrorCode {
     # Formats any error code representation (signed int, long, hex string, decimal string) as '0xHHHHHHHH'
-    param($Code)
+    # -AlreadyHex: treat an all-digit string as hex, not decimal (e.g. ETW 'hr:' fields are always printed in hex)
+    param($Code, [switch]$AlreadyHex)
     if ($null -eq $Code) { return $null }
     try {
         if ($Code -is [int] -or $Code -is [long]) {
@@ -213,9 +217,10 @@ function Format-ErrorCode {
         if ($Code -is [string]) {
             $str = $Code.Trim()
             if ([string]::IsNullOrEmpty($str)) { return $null }
-            if ($str -match '^-?\d+$') {
-                $intVal = [int]([long]::Parse($str))
-                $u = [System.BitConverter]::ToUInt32([System.BitConverter]::GetBytes($intVal), 0)
+            if (-not $AlreadyHex -and $str -match '^-?\d+$') {
+                # Truncate to the low 32 bits rather than casting to [int], which throws for
+                # unsigned decimal HRESULT representations above 2147483647
+                $u = [System.BitConverter]::ToUInt32([System.BitConverter]::GetBytes([long]::Parse($str)), 0)
                 return '0x{0:X8}' -f $u
             }
             if ($str -match '^(?:0[xX])?([0-9a-fA-F]+)$') {
@@ -228,10 +233,10 @@ function Format-ErrorCode {
 
 function Get-DOErrorDescription {
     # Accepts: signed int32 (from ETL ErrorCode property), hex string ('0x80D01001' or '80D01001'), or decimal string
-    param($Code)
+    param($Code, [switch]$AlreadyHex)
     if ($null -eq $Code) { return $null }
     try {
-        $hex = Format-ErrorCode $Code
+        $hex = Format-ErrorCode $Code -AlreadyHex:$AlreadyHex
         if ($hex -and $script:DOErrorCodes.ContainsKey($hex)) {
             return $script:DOErrorCodes[$hex]
         }
@@ -322,6 +327,83 @@ function Write-SubHeader {
 function Pause-ForUser {
     Write-Host "`nPress Enter to continue..." -ForegroundColor DarkGray
     $null = Read-Host
+}
+
+function Write-DOTable {
+    # Bordered console table -- a lightweight alternative to Out-GridView for small datasets
+    param(
+        [object[]]$Data,
+        [string[]]$Columns,
+        [scriptblock]$RowColor,
+        [int]$MaxColWidth = 34
+    )
+    if (-not $Data -or $Data.Count -eq 0) { return }
+
+    $widths = @{}
+    foreach ($c in $Columns) {
+        $dataLen = ($Data | ForEach-Object { "$($_.$c)".Length } | Measure-Object -Maximum).Maximum
+        $widths[$c] = [math]::Min([math]::Max($c.Length, $dataLen), $MaxColWidth)
+    }
+
+    $topRule = '  +' + (($Columns | ForEach-Object { '-' * ($widths[$_] + 2) }) -join '+') + '+'
+    $midRule = $topRule
+    $botRule = $topRule
+    $header  = '  |' + (($Columns | ForEach-Object { ' ' + $_.PadRight($widths[$_]) + ' ' }) -join '|') + '|'
+
+    Write-Host $topRule -ForegroundColor DarkGray
+    Write-Host $header  -ForegroundColor Cyan
+    Write-Host $midRule -ForegroundColor DarkGray
+    foreach ($row in $Data) {
+        $color = if ($RowColor) { & $RowColor $row } else { 'White' }
+        $cells = $Columns | ForEach-Object {
+            $val = "$($row.$_)"
+            if ($val.Length -gt $widths[$_]) { $val = $val.Substring(0, $widths[$_] - 1) + '.' }
+            ' ' + $val.PadRight($widths[$_]) + ' '
+        }
+        Write-Host ('  |' + ($cells -join '|') + '|') -ForegroundColor $color
+    }
+    Write-Host $botRule -ForegroundColor DarkGray
+}
+
+function Write-DOCard {
+    # Bordered key/value card for a single object -- used where a GridView would otherwise open with just one row
+    param(
+        [string]$Title,
+        [System.Collections.Specialized.OrderedDictionary]$Fields
+    )
+    $labelWidth = ($Fields.Keys | Measure-Object -Property Length -Maximum).Maximum
+    Write-Host ""
+    Write-Host ("  +-- {0}" -f $Title) -ForegroundColor Cyan
+    foreach ($key in $Fields.Keys) {
+        $val = $Fields[$key]
+        if ($null -eq $val -or $val -eq '') { $val = '(none)' }
+        Write-Host ("  | {0} : {1}" -f $key.PadRight($labelWidth), $val) -ForegroundColor White
+    }
+    Write-Host "  +$('-' * 40)" -ForegroundColor Cyan
+}
+
+function Show-JobTimelineConsole {
+    # Chronological, colour-coded rendering of a single job's event timeline (replaces the old GridView popup)
+    param([object[]]$Timeline)
+    $meta = @{
+        'AnnounceRequest'  = @{ Icon = '->'; Color = 'DarkCyan' }
+        'AnnounceResponse' = @{ Icon = '<-'; Color = 'Cyan' }
+        'PeerConnected'    = @{ Icon = '<>'; Color = 'Green' }
+        'PeerDataTransfer' = @{ Icon = '<->'; Color = 'Yellow' }
+        'DownloadComplete' = @{ Icon = 'OK'; Color = 'Magenta' }
+    }
+    Write-SubHeader "Event Timeline ($($Timeline.Count) events)"
+    foreach ($e in $Timeline) {
+        $m     = if ($meta.ContainsKey($e.EventType)) { $meta[$e.EventType] } else { @{ Icon = '*'; Color = 'White' } }
+        $peer  = if ($e.PeerIP) { "  [$($e.PeerIP)]" } else { '' }
+        $bytes = @(
+            if ($e.BytesRecv) { "recv $($e.BytesRecv)" }
+            if ($e.BytesSent) { "sent $($e.BytesSent)" }
+        ) -join '  '
+        Write-Host ("  {0}  {1,-4} {2,-17}{3}" -f $e.TimeCreated.ToString('HH:mm:ss.fff'), $m.Icon, $e.EventType, $peer) -ForegroundColor $m.Color
+        if ($e.Detail) { Write-Host "                       $($e.Detail)" -ForegroundColor DarkGray }
+        if ($bytes)    { Write-Host "                       $bytes"       -ForegroundColor DarkGray }
+    }
 }
 
 #endregion
@@ -521,7 +603,6 @@ function Get-DOParsedGeoResponse {
             LevelName            = $_.LevelName
             ExternalIpAddress    = if ($geo) { $geo.ExternalIpAddress } else { $null }
             CountryCode          = if ($geo) { $geo.CountryCode } else { $null }
-            CacheHost            = if ($geo) { $geo.CacheHost } else { $null }
             CacheId              = if ($geo) { $geo.CacheId } else { $null }
             Version              = if ($geo) { $geo.Version } else { $null }
             ContentCert          = if ($geo -and $null -ne $geo.ContentCert) { $geo.ContentCert } else { $null }
@@ -774,8 +855,8 @@ function Show-SummaryDashboard {
         $latest = $script:GeoResponses | Sort-Object TimeCreated | Select-Object -Last 1
         Write-Host "  External IP  : $($latest.ExternalIpAddress)" -ForegroundColor White
         Write-Host "  Country      : $($latest.CountryCode)" -ForegroundColor White
-        if ($latest.CacheHost) {
-            Write-Host "  Cache Host   : $($latest.CacheHost)" -ForegroundColor Cyan
+        if ($latest.KeyValueUri) {
+            Write-Host "  KeyValue Endpoint : $($latest.KeyValueUri)" -ForegroundColor Cyan
         }
         if ($latest.Version) {
             Write-Host "  Config Ver   : $($latest.Version.Substring(0, [math]::Min(16, $latest.Version.Length)))..." -ForegroundColor DarkGray
@@ -890,7 +971,7 @@ function Show-DownloadsByCaller {
 }
 
 function Show-FailedDownloads {
-    $failed = $script:DownloadComplete | Where-Object { $_.ErrorCode -and $_.ErrorCode -ne '0' -and $_.ErrorCode -ne '' }
+    $failed = $script:DownloadComplete | Where-Object { $_.ErrorCode }
     if ($failed.Count -eq 0) {
         Write-Host "`n  No failed downloads found." -ForegroundColor Green
         Pause-ForUser
@@ -937,10 +1018,10 @@ function Invoke-JobTrace {
     Write-Host "  Caller     : $($selectedJob.Caller)" -ForegroundColor Gray
     Write-Host "  Completed  : $jobTime" -ForegroundColor Gray
 
-    # Find SwarmIds — Strategy 1: ContentId in FileId
+    # Find SwarmIds — Strategy 1: ContentId matches FileId (both are the same SHA1 hex format)
     $swarmIds = @($script:InternalAnnounce | Where-Object {
         $_.TimeCreated -ge $windowStart -and $_.TimeCreated -le $windowEnd -and
-        $_.ContentId -and $fileId -and ($fileId -like "*$($_.ContentId)*" -or $_.ContentId -like "*$fileId*")
+        $_.ContentId -and $fileId -and $_.ContentId -eq $fileId
     } | Select-Object -ExpandProperty SwarmId | Where-Object { $_ } | Sort-Object -Unique)
 
     # Strategy 2: Match AltCatalogId (URL) stripped of query parameters
@@ -1046,8 +1127,7 @@ function Invoke-JobTrace {
 
     $sortedTimeline = $timeline | Sort-Object TimeCreated
 
-    # Display timeline in GridView
-    $sortedTimeline | Out-GridView -Title "Job Timeline: $jobId  [$($sortedTimeline.Count) events]"
+    Show-JobTimelineConsole -Timeline $sortedTimeline
 
     # Console byte summary — use unified Show-DOByteSourceSummary
     $segNote = if ($fileDownload -and $fileDownload.SegmentCount -gt 1) { " for this Job (aggregated across $($fileDownload.SegmentCount) segments)" } else { ' for this Job' }
@@ -1200,12 +1280,9 @@ function Show-PerJobPeerActivity {
     Write-Host ("  CdnUrl     : {0}" -f $fullJob.CdnUrl)   -ForegroundColor Gray
 
     # ── Correlate to SwarmId ──────────────────────────────────────────────────
-    # Strategy 1: ContentId appears in FileId (reliable for Windows Update)
+    # Strategy 1: ContentId matches FileId exactly (both are the same SHA1 hex format)
     $matchedIA = @($script:InternalAnnounce | Where-Object {
-        $_.ContentId -and $fileId -and (
-            $fileId      -like "*$($_.ContentId)*" -or
-            $_.ContentId -like "*$fileId*"
-        )
+        $_.ContentId -and $fileId -and $_.ContentId -eq $fileId
     })
     $swarmIds    = @($matchedIA.SwarmId | Where-Object { $_ } | Sort-Object -Unique)
     $matchMethod = 'ContentId'
@@ -1272,8 +1349,8 @@ function Show-PerJobPeerActivity {
         if ($withHrErr.Count -gt 0 -and $withFail.Count -eq 0) {
             Write-SubHeader "Non-zero HR Responses"
             $withHrErr | ForEach-Object {
-                $hrFmt   = Format-ErrorCode $_.Hr
-                $desc    = Get-DOErrorDescription $_.Hr
+                $hrFmt   = Format-ErrorCode $_.Hr -AlreadyHex
+                $desc    = Get-DOErrorDescription $_.Hr -AlreadyHex
                 $descStr = if ($desc) { "  — $desc" } else { '' }
                 Write-Host ("  {0}  Hr={1}{2}" -f $_.TimeCreated, $hrFmt, $descStr) -ForegroundColor Yellow
             }
@@ -1397,46 +1474,10 @@ function Show-PeeringFailureAnalysis {
     }
 
     # ── 1. Downloads in P2P-capable mode with zero peer bytes ─────────────────
+    # UniqueDownloads is already unique per (FileId + SessionId); re-downloads of the same
+    # file in a different session are kept as separate rows instead of being merged together.
     $analysisDownloads = @($script:UniqueDownloads)
-    $fileIdDupes = @($analysisDownloads | Group-Object FileId | Where-Object { $_.Count -gt 1 })
-    if ($fileIdDupes.Count -gt 0) {
-        $analysisDownloads = @(
-            $analysisDownloads | Group-Object FileId | ForEach-Object {
-                $grp = $_.Group | Sort-Object TimeCreated
-                $rep = $grp | Select-Object -Last 1
-                [PSCustomObject]@{
-                    TimeCreated         = $rep.TimeCreated
-                    FileId              = $rep.FileId
-                    SessionId           = ($grp.SessionId | Where-Object { $_ } | Sort-Object -Unique) -join ','
-                    SegmentCount        = [int]($grp | Measure-Object SegmentCount -Sum).Sum
-                    Caller              = $rep.Caller
-                    CdnUrl              = $rep.CdnUrl
-                    CdnIp               = $rep.CdnIp
-                    CacheHost           = $rep.CacheHost
-                    FileBytes           = [long]($grp | Measure-Object FileBytes -Maximum).Maximum
-                    CdnBytes            = [long]($grp | Measure-Object CdnBytes -Sum).Sum
-                    DoincBytes          = [long]($grp | Measure-Object DoincBytes -Sum).Sum
-                    LanBytes            = [long]($grp | Measure-Object LanBytes -Sum).Sum
-                    LinkLocalBytes      = [long]($grp | Measure-Object LinkLocalBytes -Sum).Sum
-                    GroupBytes          = [long]($grp | Measure-Object GroupBytes -Sum).Sum
-                    InetBytes           = [long]($grp | Measure-Object InetBytes -Sum).Sum
-                    Peers               = [int]($grp | Measure-Object Peers -Maximum).Maximum
-                    DownBps             = [long]($grp | Measure-Object DownBps -Maximum).Maximum
-                    UpBps               = [long]($grp | Measure-Object UpBps -Maximum).Maximum
-                    TimeMs              = [long]($grp | Measure-Object TimeMs -Maximum).Maximum
-                    SessionTimeMs       = [long]($grp | Measure-Object SessionTimeMs -Maximum).Maximum
-                    DownloadMode        = $rep.DownloadMode
-                    DownloadModeDesc    = $rep.DownloadModeDesc
-                    DownloadModeSrc     = $rep.DownloadModeSrc
-                    DownloadModeSrcDesc = $rep.DownloadModeSrcDesc
-                    GroupId             = $rep.GroupId
-                    Background          = $rep.Background
-                    IsVpn               = $rep.IsVpn
-                    IsThrottled         = $rep.IsThrottled
-                }
-            }
-        )
-    }
+    $refileCount = @($analysisDownloads | Group-Object FileId | Where-Object { $_.Count -gt 1 }).Count
 
     $p2pModes    = @(1, 2, 3)
     $eligible    = @($analysisDownloads | Where-Object { $p2pModes -contains $_.DownloadMode -and $_.CdnUrl })
@@ -1446,8 +1487,8 @@ function Show-PeeringFailureAnalysis {
     Write-SubHeader "Downloads in P2P-Capable Mode (1/2/3) with CDN URL"
     Write-Host ("  Segment DownloadComplete events : {0}" -f $script:DownloadComplete.Count) -ForegroundColor DarkGray
     Write-Host ("  Unique files/sessions parsed   : {0}" -f $script:UniqueDownloads.Count) -ForegroundColor DarkGray
-    if ($fileIdDupes.Count -gt 0) {
-        Write-Host ("  FileId duplicate groups found  : {0} (extra collapse applied)" -f $fileIdDupes.Count) -ForegroundColor Yellow
+    if ($refileCount -gt 0) {
+        Write-Host ("  Files re-downloaded in multiple sessions : {0} (kept separate, not merged)" -f $refileCount) -ForegroundColor Yellow
     }
     Write-Host ("  Total eligible files      : {0}" -f $eligible.Count)    -ForegroundColor White
     Write-Host ("  Files with peer bytes     : {0}" -f $hadPeers.Count)    -ForegroundColor $(if ($hadPeers.Count    -gt 0) { 'Green'  } else { 'Yellow' })
@@ -1466,8 +1507,8 @@ function Show-PeeringFailureAnalysis {
 
     if ($hrErrResps.Count -gt 0) {
         $hrErrResps | Group-Object Hr | Sort-Object Count -Descending | ForEach-Object {
-            $hrFmt   = Format-ErrorCode $_.Name
-            $desc    = Get-DOErrorDescription $_.Name
+            $hrFmt   = Format-ErrorCode $_.Name -AlreadyHex
+            $desc    = Get-DOErrorDescription $_.Name -AlreadyHex
             $descStr = if ($desc) { "  — $desc" } else { '' }
             Write-Host ("    {0,-14} x{1,-5}{2}" -f $hrFmt, $_.Count, $descStr) -ForegroundColor Red
         }
@@ -1543,7 +1584,10 @@ function Show-PeeringFailureAnalysis {
         Write-Host ("  Swarms with no peers ever : {0}" -f $nopeersSwarms.Count) -ForegroundColor $(if ($nopeersSwarms.Count -gt 0) { 'Yellow' } else { 'Green' })
         Write-Host ("  Swarms with failures      : {0}" -f $failedSwarms.Count)  -ForegroundColor $(if ($failedSwarms.Count  -gt 0) { 'Red'    } else { 'Green' })
 
-        $swarmSummary | Out-GridView -Title "Per-Swarm Peer Summary ($($swarmSummary.Count) swarms)"
+        Write-DOTable -Data $swarmSummary -Columns @('SwarmId', 'AnnounceCount', 'MaxPeersSeen', 'FailureResponses', 'HrErrors', 'Status') -RowColor {
+            param($row)
+            switch ($row.Status) { 'FAILED' { 'Red' } 'NO PEERS' { 'Yellow' } default { 'Green' } }
+        }
     }
 
     # ── 5. Zero-peer eligible jobs GridView ───────────────────────────────────
@@ -1620,9 +1664,16 @@ function Show-MCCAnalysisReport {
             Write-Host ("  Files   : {0} download(s)" -f $svr.Downloads)                              -ForegroundColor White
             Write-Host ("  Bytes   : {0}  ({1}% of total data)" -f $svr.BytesHuman, $svr.PctOfTotal) -ForegroundColor Cyan
         }
-        Write-Host ""
-        $byServer | Select-Object MccIP, XCid, MccType, Downloads, BytesHuman, PctOfTotal |
-            Out-GridView -Title "MCC Server Breakdown ($($byServer.Count) server(s))"
+        Write-DOTable -Data $byServer -Columns @('MccIP', 'XCid', 'MccType', 'Downloads', 'BytesHuman', 'PctOfTotal') -RowColor {
+            param($row)
+            switch -Regex ($row.MccType) {
+                'Distribution Point' { 'Green';  break }
+                'Standalone'         { 'Cyan';   break }
+                'Internet'           { 'Yellow'; break }
+                'CDN'                { 'Gray';   break }
+                default              { 'White' }
+            }
+        }
     } else {
         Write-Host "`n  MCC activity detected but server IP could not be resolved (cacheHost field empty in logs)." -ForegroundColor Yellow
         Write-Host ("  Total MCC bytes: {0}" -f (Format-Bytes $totalMcc)) -ForegroundColor Cyan
@@ -1641,17 +1692,44 @@ function Show-MCCAnalysisReport {
     Pause-ForUser
 }
 
+function Show-GeoResponseHistory {
+    Write-Header "GEO Response History"
+    if ($script:GeoResponses.Count -eq 0) {
+        Write-Host "  No GEO responses recorded in this log." -ForegroundColor Yellow
+        Pause-ForUser
+        return
+    }
+    if ($script:GeoResponses.Count -eq 1) {
+        $g = $script:GeoResponses[0]
+        Write-DOCard -Title "GEO Response @ $($g.TimeCreated)" -Fields ([ordered]@{
+            'External IP'       = $g.ExternalIpAddress
+            'Country'           = $g.CountryCode
+            'Cache Id'          = $g.CacheId
+            'KeyValue Endpoint' = $g.KeyValueUri
+            'Version'           = $g.Version
+        })
+    } elseif ($script:GeoResponses.Count -le 20) {
+        $shaped = $script:GeoResponses | Select-Object @{ N = 'Time'; E = { $_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss') } },
+            @{ N = 'ExternalIP'; E = { $_.ExternalIpAddress } }, @{ N = 'Country'; E = { $_.CountryCode } },
+            @{ N = 'CacheId'; E = { $_.CacheId } }, @{ N = 'KeyValueUri'; E = { $_.KeyValueUri } }
+        Write-DOTable -Data $shaped -Columns @('Time', 'ExternalIP', 'Country', 'CacheId', 'KeyValueUri')
+    } else {
+        $script:GeoResponses | Out-GridView -Title "GEO Responses ($($script:GeoResponses.Count))"
+    }
+    Pause-ForUser
+}
+
 function Show-NetworkGeoMenu {
     do {
         if (-not (Assert-LogsLoaded)) { return }
         Write-Header "Network & GEO Analysis"
-        Write-Host "  1. GEO service responses / External IP history (GridView)"
+        Write-Host "  1. GEO service responses / External IP history"
         Write-Host "  2. Connected Cache (MCC) analysis"
         Write-Host "  3. CDN source analysis (GridView)"
         Write-Host "  Q. Back"
         $sel = (Read-Host "`n  Selection").Trim().ToLower()
         switch ($sel) {
-            '1' { $script:GeoResponses | Out-GridView -Title "GEO Responses ($($script:GeoResponses.Count))" }
+            '1' { Show-GeoResponseHistory }
             '2' { Show-MCCAnalysisReport }
             '3' {
                 $cdnData = $script:DownloadComplete | Where-Object { $_.CdnIp -or $_.CdnUrl } |
@@ -1795,7 +1873,31 @@ function Invoke-StatusCorrelation {
     $matched = @($correlated | Where-Object { $_.LogFound })
     Write-Host "  Matched $($matched.Count) of $($statusEntries.Count) status entries to log events." -ForegroundColor $(if ($matched.Count -gt 0) { 'Green' } else { 'Yellow' })
 
-    $correlated | Out-GridView -Title "Status ↔ Log Correlation ($($correlated.Count) entries, $($matched.Count) matched)"
+    if ($correlated.Count -eq 1) {
+        $c = $correlated[0]
+        Write-DOCard -Title "Status Correlation: $($c.FileId)" -Fields ([ordered]@{
+            'Status'                    = $c.Status
+            'Download Mode (live)'      = $c.DownloadMode
+            'File Size'                 = $c.FileSize
+            'Bytes From CDN'            = $c.BytesFromCDN
+            'Bytes From Peers'          = $c.BytesFromPeers
+            'Bytes From Cache Host'     = $c.BytesFromCacheHost
+            '% Peer Caching'            = $c.PercentPeerCaching
+            'Cache Host'                = $c.CacheHost
+            'Log Match Found'           = $c.LogFound
+            'Log Caller'                = $c.LogCaller
+            'Log Segments'              = $c.LogSegments
+            'Log File Bytes'            = $c.LogFileBytes
+            'Log CDN Bytes'             = $c.LogCdnBytes
+            'Log Peer Bytes'            = $c.LogPeerBytes
+            'Log Connected Cache Bytes' = $c.LogDoincBytes
+            'Log P2P %'                 = $c.LogP2PPct
+            'Log Download Mode'         = $c.LogDownloadMode
+            'Log Duration'              = $c.LogDuration
+        })
+    } else {
+        $correlated | Out-GridView -Title "Status ↔ Log Correlation ($($correlated.Count) entries, $($matched.Count) matched)"
+    }
     Pause-ForUser
 }
 
